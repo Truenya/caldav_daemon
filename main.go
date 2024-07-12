@@ -23,16 +23,22 @@ const (
 	notifyEnvOffset         = "CALDAV_SERVER_OFFSET_HOURS"
 	notifyEnvRefreshPeriod  = "CALDAV_REFRESH_PERIOD_MINUTES"
 	notifyEnvTimeBefore     = "CALDAV_NOTIFY_BEFORE_MINUTES"
+	notifyEnvWithSound      = "CALDAV_NOTIFY_WITH_SOUND"
 )
 
 func main() {
+	// TODO delete on first external contribution
 	notify.Notify("", "https://github.com/Truenya", "notification daemon started", "")
 	events := make(chan event)
 	go planEvents(events)
 
 	icon := os.Getenv(notifyEnvIcon)
 	for e := range events {
-		notify.Notify("", e.Summary, e.Description, icon)
+		if sound := os.Getenv(notifyEnvWithSound); sound != "" {
+			notify.Alert("", e.Summary, e.Description, icon)
+		} else {
+			notify.Notify("", e.Summary, e.Description, icon)
+		}
 	}
 }
 

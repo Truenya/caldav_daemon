@@ -40,6 +40,7 @@ killall go
 - CALDAV_SERVER_OFFSET_HOURS default - same as server
 - CALDAV_REFRESH_PERIOD_MINUTES default 10
 - CALDAV_NOTIFY_BEFORE_MINUTES default 5
+- CALDAV_NOTIFY_WITH_SOUND default no. if not empty - sound will be produced
 
 ## for better experience
 it is useful to create env file with environment variables and source it
