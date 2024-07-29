@@ -33,8 +33,9 @@ func main() {
 	go planEvents(events)
 
 	icon := os.Getenv(notifyEnvIcon)
+	needSound := os.Getenv(notifyEnvWithSound) != ""
 	for e := range events {
-		if sound := os.Getenv(notifyEnvWithSound); sound != "" {
+		if needSound {
 			notify.Alert("", e.Summary, e.Description, icon)
 		} else {
 			notify.Notify("", e.Summary, e.Description, icon)
@@ -47,9 +48,9 @@ func planEvents(ch chan event) {
 	offset := getOffsetByServer()
 	period := getRefreshPeriod()
 	timeBefore := getTimeBeforeNotify()
+
 	for {
-		events := getEvents(offset)
-		checkAndRememberEvents(ch, events, planned, timeBefore)
+		checkAndRememberEvents(ch, getEvents(offset), planned, timeBefore)
 		time.Sleep(period)
 	}
 }
@@ -58,9 +59,6 @@ func checkAndRememberEvents(ch chan event, events []event, planned map[string]st
 	for _, e := range events {
 		key := e.Summary + e.Start.String()
 		if _, ok := planned[key]; ok || e.isPast() {
-			if e.isToday() {
-				fmt.Printf("skipping event from past: %s at: %s\n %s", e.Summary, e.Start.String(), messageAboutOffsets)
-			}
 			continue
 		}
 
@@ -99,7 +97,7 @@ func getEvents(offset time.Duration) []event {
 			fmt.Printf("failed to parse event: %+v", e)
 			continue
 		}
-		result[i] = e
+		result[i] = repeatedEventFromEvent(e)
 	}
 
 	return result
@@ -112,6 +110,8 @@ type eventRaw struct {
 	Datestamp   string
 	Summary     string
 	Description string
+	Duration    string
+	Rrule       *rruleRaw
 }
 
 type event struct {
@@ -121,14 +121,22 @@ type event struct {
 	Start       time.Time
 	End         time.Time
 	CreatedAt   time.Time
+	Rrule       *rrule
 }
 
-func (e event) isPast() bool {
-	return e.Start.Before(time.Now()) && e.End.Before(time.Now())
+type rruleRaw struct {
+	Freq     []string
+	Until    *string
+	ByDay    []string
+	Interval []int
 }
 
-func (e event) isToday() bool {
-	return e.Start.Day() == time.Now().Day()
+type rrule struct {
+	Freq     string
+	Until    *time.Time
+	ByDay    map[time.Weekday]struct{}
+	Interval int
+	Duration time.Duration
 }
 
 func eventFromEventRaw(raw eventRaw, offset time.Duration) (event, error) {
@@ -143,13 +151,14 @@ func eventFromEventRaw(raw eventRaw, offset time.Duration) (event, error) {
 		// The time comes according to the server time zone, but is read as UTC, so we subtract offset
 		// Let's assume that the server is in the same zone as the client
 		// Otherwise, offset must be set in the corresponding environment variable
-		_, offset := time.Now().Zone()
-
-		// change time by timezone of current location
-		start = start.Add(-time.Duration(offset) * time.Second)
-		end = end.Add(-time.Duration(offset) * time.Second)
-		datestamp = datestamp.Add(-time.Duration(offset) * time.Second)
+		_, offsetI := time.Now().Zone()
+		offset = time.Duration(offsetI) * time.Second
 	}
+
+	// change time by timezone of current location
+	start = start.Add(-offset)
+	end = end.Add(-offset)
+	datestamp = datestamp.Add(-offset)
 
 	return event{
 		Name:        raw.Name,
@@ -158,7 +167,129 @@ func eventFromEventRaw(raw eventRaw, offset time.Duration) (event, error) {
 		Start:       start,
 		End:         end,
 		CreatedAt:   datestamp,
+		Rrule:       readRrule(raw.Rrule, offset, raw.Duration),
 	}, nil
+}
+
+func repeatedEventFromEvent(e event) event {
+	if e.Rrule == nil || (e.Rrule.Until != nil && e.Rrule.Until.Before(time.Now())) {
+		return e
+	}
+
+	if !e.Rrule.checkByFreq(e.Start) {
+		return e
+	}
+
+	today0 := time.Now().UTC().Truncate(24 * time.Hour)
+	e.Start = today0.Add(offsetFromTime(e.Start))
+	e.End = e.Start.Add(e.Rrule.Duration)
+
+	return e
+}
+
+func (r rrule) checkByFreq(start time.Time) bool {
+	switch r.Freq {
+	case "WEEKLY":
+		if r.ByDay == nil {
+			return false
+		}
+
+		if _, ok := r.ByDay[time.Now().Weekday()]; !ok {
+			return false
+		}
+
+		_, w := time.Now().ISOWeek()
+		_, w2 := start.ISOWeek()
+
+		return (w2-w)%r.Interval == 0
+	case "DAILY":
+		return (start.Day()-time.Now().Day())%r.Interval == 0
+	case "MONTHLY":
+		return (int(start.Month())-int(time.Now().Month()))%r.Interval == 0
+	case "YEARLY":
+		return (start.Year()-time.Now().Year())%r.Interval == 0
+	default:
+		return false
+	}
+}
+
+func offsetFromTime(t time.Time) time.Duration {
+	h, m, s := t.Clock()
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(s)*time.Second
+}
+
+func readRrule(raw *rruleRaw, offset time.Duration, dur string) *rrule {
+	if raw == nil {
+		return nil
+	}
+
+	res := &rrule{
+		Freq:     getFirst(raw.Freq),
+		Interval: getFirst(raw.Interval),
+		Until:    parseTime(raw.Until, offset),
+		Duration: durationFromString(dur),
+	}
+
+	if len(raw.ByDay) == 0 {
+		return res
+	}
+
+	res.ByDay = make(map[time.Weekday]struct{})
+	for _, day := range raw.ByDay {
+		res.ByDay[dayFromString(day)] = struct{}{}
+	}
+
+	return res
+}
+
+func getFirst[T any](arr []T) T {
+	if len(arr) == 0 {
+		return *new(T)
+	}
+	return arr[0]
+}
+
+func parseTime(raw *string, offset time.Duration) *time.Time {
+	if raw == nil {
+		return nil
+	}
+	res, _ := time.Parse(timeFormat, *raw)
+	res = res.Add(-offset)
+	return &res
+}
+
+func durationFromString(dur string) time.Duration {
+	tmp := strings.Split(dur, ":")
+	if len(tmp) < 3 {
+		return 0
+	}
+	dur = tmp[0] + "h" + tmp[1] + "m" + tmp[2] + "s"
+	res, err := time.ParseDuration(dur)
+	if err != nil {
+		return 0
+	}
+	return res
+}
+
+func dayFromString(day string) time.Weekday {
+	switch day {
+	case "MO":
+		return time.Monday
+	case "TU":
+		return time.Tuesday
+	case "WE":
+		return time.Wednesday
+	case "TH":
+		return time.Thursday
+	case "FR":
+		return time.Friday
+	case "SA":
+		return time.Saturday
+	case "SU":
+		return time.Sunday
+	default:
+		return time.Sunday
+	}
 }
 
 func getRefreshPeriod() time.Duration {
@@ -210,4 +341,8 @@ func processExitError(err error) {
 
 	fmt.Println("Unauthorized. Please check your credentials in python script.")
 	os.Exit(1)
+}
+
+func (e event) isPast() bool {
+	return e.Start.Before(time.Now()) && e.End.Before(time.Now())
 }
